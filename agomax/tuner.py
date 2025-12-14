@@ -1,9 +1,14 @@
 # ==============================================================================
 # tuner.py
 # PURPOSE:
-#   Hyperparameter tuning for unsupervised anomaly models
-#   Trains ONLY on NORMAL data
-#   Returns best hyperparameters
+#   Hyperparameter tuning for Agomax (NORMAL DATA ONLY)
+#
+#   - Scorers (KMeans, LOF, OCSVM):
+#       tuned to minimize false positives on NORMAL data
+#
+#   - Explainers (DBSCAN, OPTICS):
+#       NOT tuned for anomaly rate
+#       kept stable for structural context only
 # ==============================================================================
 
 import numpy as np
@@ -17,24 +22,19 @@ class HyperparameterTuner:
     def __init__(
         self,
         max_anomaly_rate=0.01,
-        percentile=99.7,
-        random_state=42
+        random_state=42,
     ):
         self.max_anomaly_rate = max_anomaly_rate
-        self.percentile = percentile
         self.random_state = random_state
 
     # ------------------------------------------------------------------
-    # Utility
+    # Utilities
     # ------------------------------------------------------------------
     def _rate(self, flags):
-        return np.mean(flags)
-
-    def _percentile_thresh(self, scores):
-        return np.percentile(scores, self.percentile)
+        return float(np.mean(flags))
 
     # ------------------------------------------------------------------
-    # KMEANS
+    # KMEANS (SCORER)
     # ------------------------------------------------------------------
     def tune_kmeans(self, X):
         best = None
@@ -52,50 +52,18 @@ class HyperparameterTuner:
                 axis=1
             )
 
-            flags = dist > self._percentile_thresh(dist)
-            rate = self._rate(flags)
+            # static sanity check (NOT runtime logic)
+            thresh = np.mean(dist) + 3 * np.std(dist)
+            rate = self._rate(dist > thresh)
 
             if rate <= self.max_anomaly_rate:
                 best = {"n_clusters": k}
                 break
 
-        if best is None:
-            best = {"n_clusters": 2}
-
-        return best
+        return best or {"n_clusters": 2}
 
     # ------------------------------------------------------------------
-    # DBSCAN
-    # ------------------------------------------------------------------
-    def tune_dbscan(self, X):
-        for eps in [0.8, 1.2, 1.6]:
-            for ms in [10, 20, 30]:
-                model = DBSCAN(eps=eps, min_samples=ms)
-                labels = model.fit_predict(X)
-
-                rate = self._rate(labels == -1)
-                if rate <= self.max_anomaly_rate:
-                    return {"eps": eps, "min_samples": ms}
-
-        return {"eps": 1.2, "min_samples": 20}
-
-    # ------------------------------------------------------------------
-    # OPTICS
-    # ------------------------------------------------------------------
-    def tune_optics(self, X):
-        for ms in [10, 20, 30]:
-            for xi in [0.03, 0.05, 0.1]:
-                model = OPTICS(min_samples=ms, xi=xi)
-                labels = model.fit_predict(X)
-
-                rate = self._rate(labels == -1)
-                if rate <= self.max_anomaly_rate:
-                    return {"min_samples": ms, "xi": xi}
-
-        return {"min_samples": 20, "xi": 0.05}
-
-    # ------------------------------------------------------------------
-    # LOF
+    # LOF (SCORER)
     # ------------------------------------------------------------------
     def tune_lof(self, X):
         for k in [20, 30, 40]:
@@ -106,20 +74,20 @@ class HyperparameterTuner:
             model.fit(X)
 
             scores = -model.score_samples(X)
-            flags = scores > self._percentile_thresh(scores)
+            thresh = np.mean(scores) + 3 * np.std(scores)
+            rate = self._rate(scores > thresh)
 
-            rate = self._rate(flags)
             if rate <= self.max_anomaly_rate:
                 return {"n_neighbors": k}
 
         return {"n_neighbors": 30}
 
     # ------------------------------------------------------------------
-    # OCSVM
+    # OCSVM (SCORER)
     # ------------------------------------------------------------------
     def tune_ocsvm(self, X):
         for nu in [0.005, 0.01, 0.02]:
-            for gamma in ["scale", 0.1, 0.01]:
+            for gamma in ["scale", 0.1]:
                 model = OneClassSVM(
                     nu=nu,
                     gamma=gamma
@@ -127,13 +95,39 @@ class HyperparameterTuner:
                 model.fit(X)
 
                 scores = -model.score_samples(X)
-                flags = scores > self._percentile_thresh(scores)
+                thresh = np.mean(scores) + 3 * np.std(scores)
+                rate = self._rate(scores > thresh)
 
-                rate = self._rate(flags)
                 if rate <= self.max_anomaly_rate:
                     return {"nu": nu, "gamma": gamma}
 
         return {"nu": 0.01, "gamma": "scale"}
+
+    # ------------------------------------------------------------------
+    # DBSCAN (EXPLAINER ONLY)
+    # ------------------------------------------------------------------
+    def tune_dbscan(self, X):
+        """
+        NOT tuned for anomaly rate.
+        Just stable defaults for structure.
+        """
+        return {
+            "eps": 1.2,
+            "min_samples": 20
+        }
+
+    # ------------------------------------------------------------------
+    # OPTICS (EXPLAINER ONLY)
+    # ------------------------------------------------------------------
+    def tune_optics(self, X):
+        """
+        NOT tuned for anomaly rate.
+        Used only for reachability context.
+        """
+        return {
+            "min_samples": 20,
+            "xi": 0.05
+        }
 
     # ------------------------------------------------------------------
     # TUNE ALL
@@ -141,10 +135,10 @@ class HyperparameterTuner:
     def tune_all(self, X):
         return {
             "kmeans": self.tune_kmeans(X),
-            "dbscan": self.tune_dbscan(X),
-            "optics": self.tune_optics(X),
             "lof": self.tune_lof(X),
             "ocsvm": self.tune_ocsvm(X),
+            "dbscan": self.tune_dbscan(X),
+            "optics": self.tune_optics(X),
         }
 
 
@@ -153,7 +147,7 @@ class HyperparameterTuner:
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("[TEST] Running hyperparameter tuner self-test")
+    print("[TEST] Hyperparameter tuner sanity test")
 
     rng = np.random.default_rng(42)
     X = rng.normal(0, 1, size=(3000, 10))
@@ -164,4 +158,4 @@ if __name__ == "__main__":
     for model, p in params.items():
         print(f"[OK] {model}: {p}")
 
-    print("[DONE] tuner.py self-test completed")
+    print("[DONE] tuner.py test completed")

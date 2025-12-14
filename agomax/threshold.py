@@ -1,9 +1,13 @@
 # ==============================================================================
 # threshold.py
 # PURPOSE:
-#   Robust thresholding utilities for anomaly scores
-#   Default: 99.7 percentile
-#   Optional: MAD
+#   Adaptive thresholding for anomaly scores using rolling statistics
+#   (mean + k * std)
+#
+#   NOTE:
+#   - Operates PER MODEL
+#   - Operates PER TIME SERIES
+#   - NO event aggregation
 # ==============================================================================
 
 import numpy as np
@@ -17,10 +21,10 @@ def _validate_scores(scores):
     if scores is None:
         raise ValueError("scores is None")
 
-    scores = np.asarray(scores)
+    scores = np.asarray(scores, dtype=float)
 
     if scores.ndim != 1:
-        raise ValueError("scores must be a 1D array")
+        raise ValueError("scores must be 1D")
 
     if len(scores) == 0:
         raise ValueError("scores is empty")
@@ -32,58 +36,127 @@ def _validate_scores(scores):
 
 
 # ==============================================================================
-# INTERNAL METHODS
+# ADAPTIVE THRESHOLD (STREAMING)
 # ==============================================================================
 
-def _percentile_threshold(scores, percentile):
-    if not (0 < percentile < 100):
-        raise ValueError("percentile must be between 0 and 100")
+from collections import deque
 
-    return float(np.percentile(scores, percentile))
+class AdaptiveThreshold:
+    def __init__(self, window=50, k=3.0):
+        self.window = window
+        self.k = k
+        self.buffer = deque(maxlen=window)
+        self.ready = False
+
+    def update(self, score):
+        """
+        Update threshold state and return (is_anomaly, threshold).
+        Only updates buffer if score is NOT anomalous (to prevent poisoning).
+        """
+        # 1. Compute current threshold based on PAST history
+        if len(self.buffer) < 2:
+            # Not enough history yet
+            thresh = float('inf')
+            self.ready = False
+        else:
+            # We have history
+            series = np.array(self.buffer)
+            mu = series.mean()
+            sigma = series.std()
+            
+            if sigma == 0:
+                thresh = mu
+            else:
+                thresh = mu + self.k * sigma
+            self.ready = True
+
+        # 2. Check anomaly
+        is_anomaly = score > thresh
+
+        # 3. Update history ONLY if normal (prevent threshold explosion)
+        if not is_anomaly:
+            self.buffer.append(score)
+
+        return is_anomaly, thresh
+
+    def get_state(self):
+        return {
+            "window": self.window,
+            "k": self.k,
+            "buffer": list(self.buffer)
+        }
+
+    def set_state(self, state):
+        self.window = state["window"]
+        self.k = state["k"]
+        self.buffer = deque(state["buffer"], maxlen=self.window)
 
 
-def _mad_threshold(scores, k):
+# ==============================================================================
+# ROLLING THRESHOLD (BATCH)
+# ==============================================================================
+
+def rolling_threshold(
+    scores,
+    window=50,
+    k=3.0,
+    min_periods=None
+):
+    """
+    Adaptive rolling threshold using mean + k * std.
+
+    Parameters
+    ----------
+    scores : array-like
+        Time-ordered anomaly scores (higher = more anomalous)
+    window : int
+        Rolling window size
+    k : float
+        Std multiplier (safety knob)
+    min_periods : int or None
+        Minimum samples before threshold is valid
+
+    Returns
+    -------
+    thresholds : np.ndarray
+        Adaptive threshold per timestep
+    flags : np.ndarray (bool)
+        score > threshold
+    """
+
+    scores = _validate_scores(scores)
+
+    if window <= 1:
+        raise ValueError("window must be > 1")
+
     if k <= 0:
         raise ValueError("k must be > 0")
 
-    median = np.median(scores)
-    mad = np.median(np.abs(scores - median))
+    if min_periods is None:
+        min_periods = window
 
-    if mad == 0:
-        return float(median)
+    thresholds = np.full_like(scores, fill_value=np.nan)
+    flags = np.zeros_like(scores, dtype=bool)
 
-    return float(median + k * mad)
+    for i in range(len(scores)):
+        start = max(0, i - window)
+        window_scores = scores[start:i]
 
+        if len(window_scores) < min_periods:
+            continue
 
-# ==============================================================================
-# PUBLIC API
-# ==============================================================================
+        mu = window_scores.mean()
+        sigma = window_scores.std()
 
-def compute_threshold(
-    scores,
-    method="percentile",
-    percentile=99.7,
-    k=3.5
-):
-    """
-    Default:
-        compute_threshold(scores) -> 99.7 percentile
+        if sigma == 0:
+            thresh = mu
+        else:
+            thresh = mu + k * sigma
 
-    Optional:
-        compute_threshold(scores, method="mad", k=3.5)
-    """
-    scores = _validate_scores(scores)
+        thresholds[i] = thresh
+        flags[i] = scores[i] > thresh
 
-    if method == "percentile":
-        return _percentile_threshold(scores, percentile)
-
-    if method == "mad":
-        return _mad_threshold(scores, k)
-
-    raise ValueError(
-        f"Unknown method '{method}'. "
-        "Valid methods: 'percentile' (default), 'mad'"
-    )
+    return thresholds, flags
 
 
 # ==============================================================================
@@ -91,39 +164,22 @@ def compute_threshold(
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("[TEST] Running threshold self-test")
+    print("[TEST] Rolling threshold self-test")
 
-    # Simulated anomaly scores from NORMAL data
     rng = np.random.default_rng(42)
-    scores = rng.normal(loc=0.0, scale=1.0, size=10_000)
 
-    # Default percentile
-    p_thresh = compute_threshold(scores)
-    print(f"[OK] Percentile threshold (99.7): {p_thresh:.4f}")
+    # Simulated normal scores + injected anomaly
+    scores = rng.normal(0, 1, 300)
+    scores[200:210] += 6.0  # anomaly burst
 
-    # MAD
-    mad_thresh = compute_threshold(scores, method="mad", k=3.5)
-    print(f"[OK] MAD threshold (k=3.5): {mad_thresh:.4f}")
-
-    # Sanity check
-    p_rate = (scores > p_thresh).mean() * 100
-    mad_rate = (scores > mad_thresh).mean() * 100
-
-    print(f"[INFO] Percentile exceed rate: {p_rate:.3f}%")
-    print(f"[INFO] MAD exceed rate       : {mad_rate:.3f}%")
-
-    print("[DONE] threshold.py self-test completed")
-    
-    """ Default (no thinking required)
-    thresh = compute_threshold(train_scores)
-
-
-    → 99.7 percentile automatically
-
-    Explicit MAD (advanced user)
-    thresh = compute_threshold(
-        train_scores,
-        method="mad",
-        k=3.5
+    thresholds, flags = rolling_threshold(
+        scores,
+        window=40,
+        k=3.0
     )
-    """
+
+    print(f"[INFO] Total points       : {len(scores)}")
+    print(f"[INFO] Flagged points     : {flags.sum()}")
+    print(f"[INFO] First anomaly idx  : {np.where(flags)[0][0]}")
+
+    print("[DONE] threshold.py test completed")
